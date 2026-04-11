@@ -2,16 +2,16 @@ name = "ageri-billing"
 main = "index.ts"
 compatibility_date = "2024-01-01"
 
-# Routes
-routes = [
-  { pattern = "billing.ageri.ai/*", zone_name = "ageri.ai" }
-]
+# Routes — uncomment once ageri.ai zone is active in Cloudflare
+# routes = [
+#   { pattern = "billing.ageri.ai/*", zone_name = "ageri.ai" }
+# ]
 
 # D1 — credit balances, subkeys, transactions
 [[d1_databases]]
 binding = "DB"
 database_name = "ageri-billing"
-database_id = ""   # fill after: wrangler d1 create ageri-billing
+database_id = "bf6abf1c-247f-4e0f-904a-a3ee7aa9af30"
 
 # Secrets (set via: wrangler secret put PADDLE_WEBHOOK_SECRET)
 # PADDLE_WEBHOOK_SECRET
