@@ -1,0 +1,9 @@
+name = "ageri-services"
+compatibility_date = "2024-01-01"
+
+# Workers are deployed individually — see workers/*/wrangler.toml
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ageri-billing"
+database_id = ""   # fill after: wrangler d1 create ageri-billing
