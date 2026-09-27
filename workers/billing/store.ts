@@ -123,6 +123,74 @@ export class BillingStore {
     };
   }
 
+  // ── VietQR orders ───────────────────────────────────────────────────────────
+
+  async getVietQROrder(orderId: string): Promise<{
+    order_id: string; namespace: string; tier: number;
+    amount_vnd: number; credits: number; qr_link: string | null;
+    paid: number; txn_id: string | null; created_at: string;
+  } | null> {
+    return this.db
+      .prepare("SELECT * FROM vietqr_orders WHERE order_id = ?")
+      .bind(orderId)
+      .first();
+  }
+
+  async createVietQROrder(
+    orderId: string, namespace: string, tier: number,
+    amountVnd: number, credits: number,
+  ): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT OR IGNORE INTO vietqr_orders
+           (order_id, namespace, tier, amount_vnd, credits)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .bind(orderId, namespace, tier, amountVnd, credits)
+      .run();
+  }
+
+  async setVietQRQrLink(orderId: string, qrLink: string): Promise<void> {
+    await this.db
+      .prepare("UPDATE vietqr_orders SET qr_link = ? WHERE order_id = ?")
+      .bind(qrLink, orderId)
+      .run();
+  }
+
+  /** Mark an order paid and grant credits. Returns false if already paid or not found. */
+  async markVietQRPaid(orderId: string, txnId: string): Promise<{ namespace: string; credits: number } | null> {
+    const order = await this.getVietQROrder(orderId);
+    if (!order || order.paid) return null;
+
+    await this.db.batch([
+      this.db
+        .prepare(
+          `UPDATE vietqr_orders SET paid = 1, txn_id = ?, paid_at = datetime('now')
+           WHERE order_id = ?`,
+        )
+        .bind(txnId, orderId),
+      // Grant credits via existing addCredits logic (reuse billing table)
+      this.db
+        .prepare(
+          `INSERT INTO billing (user_id, namespace, credits, updated_at)
+           VALUES (?, ?, ?, datetime('now'))
+           ON CONFLICT(user_id) DO UPDATE SET
+             credits    = credits + excluded.credits,
+             updated_at = datetime('now')`,
+        )
+        .bind(order.namespace, order.namespace, order.credits),
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO billing_transactions
+             (user_id, paddle_transaction_id, price_id, credits_granted)
+           VALUES (?, ?, 'vietqr', ?)`,
+        )
+        .bind(order.namespace, `vietqr_${txnId}`, order.credits),
+    ]);
+
+    return { namespace: order.namespace, credits: order.credits };
+  }
+
   async getTransactionHistory(namespace: string, limit = 20): Promise<TransactionRecord[]> {
     const { results } = await this.db
       .prepare(

@@ -2,9 +2,15 @@
  * ageri-billing Worker
  *
  * Routes:
- *   POST /webhook/paddle     — Paddle event receiver (HMAC verified)
- *   GET  /api/credits        — Balance + auto_reload info (?namespace=huy)
- *   GET  /api/usage          — Transaction history (?namespace=huy)
+ *   POST /webhook/paddle                — Paddle event receiver (HMAC verified)
+ *   GET  /api/credits                   — Balance + auto_reload info (?namespace=huy)
+ *   GET  /api/usage                     — Transaction history (?namespace=huy)
+ *
+ *   GET  /api/payment/get_qr_link/:ns   — Create/return VietQR order (?tier=5|10|20|50)
+ *   GET  /api/payment/check_complete/:ns — Poll for VietQR payment (?tier=5|10|20|50)
+ *   POST /api/token_generate            — VietQR fetches callback auth token here
+ *   POST /bank/api/transaction-sync     — VietQR pushes confirmed transactions here
+ *   POST /api/test/simulate_payment     — Dev: trigger a simulated VietQR payment
  *
  * Auth stubs (implemented when LLM gateway is built):
  *   POST /auth/token         — Issue agk_... subkey from refresh_token
@@ -13,55 +19,42 @@
 
 import { BillingStore } from "./store";
 import { handlePaddleWebhook } from "./paddle";
+import {
+  TIERS, encodeNamespace, decodeNamespace,
+  signJwt, verifyJwt, generateQR, simulatePayment,
+  type VietQRConfig,
+} from "./vietqr";
 
 export interface Env {
   DB: D1Database;
   PADDLE_WEBHOOK_SECRET: string;
+  // Server-to-server secret for the routes that read or act on an account.
+  // Ageri already SENDS this (chat.py `_billing_headers`, BILLING_SERVER_SECRET);
+  // until now nothing verified it. Unset means every guarded route is refused.
+  BILLING_SERVER_SECRET: string;
+  // Never set in production. Gates the VietQR payment simulator.
+  ALLOW_TEST_PAYMENTS: string;
+  // VietQR — set via: wrangler secret put <NAME>
+  VIETQR_BASE_URL: string;           // https://api.vietqr.org  (or https://dev.vietqr.org)
+  VIETQR_USERNAME: string;
+  VIETQR_PASSWORD: string;           // base64-encoded
+  VIETQR_BANK_CODE: string;          // e.g. "MB"
+  VIETQR_BANK_ACCOUNT: string;       // receiving account number (a secret, never a literal)
+  VIETQR_BANK_NAME: string;          // account holder name
+  VIETQR_CALLBACK_USERNAME: string;  // credentials VietQR uses to call our token endpoint
+  VIETQR_CALLBACK_PASSWORD: string;
+  VIETQR_JWT_SECRET: string;         // min 32 chars
 }
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    const store = new BillingStore(env.DB);
+// ── Order TTL: 10 minutes ─────────────────────────────────────────────────────
 
-    // POST /webhook/paddle
-    if (request.method === "POST" && url.pathname === "/webhook/paddle") {
-      return handlePaddleWebhook(request, store, env.PADDLE_WEBHOOK_SECRET);
-    }
+const ORDER_TTL_MS = 10 * 60 * 1000;
 
-    // GET /api/credits?namespace=huy
-    if (request.method === "GET" && url.pathname === "/api/credits") {
-      const namespace = url.searchParams.get("namespace");
-      if (!namespace) {
-        return json({ error: "namespace required" }, 400);
-      }
-      const info = await store.getBillingInfo(namespace);
-      return json(info);
-    }
+function isExpired(createdAt: string): boolean {
+  return Date.now() - new Date(createdAt + "Z").getTime() > ORDER_TTL_MS;
+}
 
-    // GET /api/usage?namespace=huy
-    if (request.method === "GET" && url.pathname === "/api/usage") {
-      const namespace = url.searchParams.get("namespace");
-      if (!namespace) {
-        return json({ error: "namespace required" }, 400);
-      }
-      const history = await store.getTransactionHistory(namespace);
-      return json(history);
-    }
-
-    // POST /auth/token — stub
-    if (request.method === "POST" && url.pathname === "/auth/token") {
-      return json({ error: "not implemented" }, 501);
-    }
-
-    // POST /auth/rotate — stub
-    if (request.method === "POST" && url.pathname === "/auth/rotate") {
-      return json({ error: "not implemented" }, 501);
-    }
-
-    return new Response("Not Found", { status: 404 });
-  },
-};
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -69,3 +62,257 @@ function json(body: unknown, status = 200): Response {
     headers: { "Content-Type": "application/json" },
   });
 }
+
+/**
+ * WHO IS ALLOWED TO ASK ABOUT AN ACCOUNT.
+ *
+ * A namespace is a short, guessable string, so a route that takes one from the query
+ * string and answers is a route that hands every customer's balance, auto-reload state,
+ * subscription id and transaction history to anyone who can guess a username. These
+ * routes are only ever called SERVER TO SERVER: the browser talks to Ageri, and Ageri
+ * talks to this worker. Nothing here is meant to be reachable from a page.
+ *
+ * The calling half already existed and nothing checked it. `ageri/web/routes/chat.py`
+ * builds `Authorization: Bearer $BILLING_SERVER_SECRET` in `_billing_headers()`, and
+ * this worker read the header for the two VietQR callbacks and for nothing else.
+ *
+ * FAIL CLOSED. With no secret configured this returns false rather than true, so a
+ * deploy that forgets to set it breaks loudly instead of staying quietly open.
+ */
+async function sameSecret(a: string, b: string): Promise<boolean> {
+  if (!a || !b) return false;
+  const enc = new TextEncoder();
+  // Compared as digests: equal length whatever the inputs, so neither the secret's
+  // length nor its first differing byte is observable in the timing.
+  const [ha, hb] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(a)),
+    crypto.subtle.digest("SHA-256", enc.encode(b)),
+  ]);
+  const x = new Uint8Array(ha), y = new Uint8Array(hb);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+async function serverToServer(request: Request, env: Env): Promise<boolean> {
+  const got = request.headers.get("Authorization") || "";
+  if (!got.startsWith("Bearer ")) return false;
+  return sameSecret(got.slice(7), env.BILLING_SERVER_SECRET || "");
+}
+
+function vietqrCfg(env: Env): VietQRConfig {
+  return {
+    baseUrl: env.VIETQR_BASE_URL || "https://dev.vietqr.org",
+    username: env.VIETQR_USERNAME,
+    password: env.VIETQR_PASSWORD,
+    bankCode: env.VIETQR_BANK_CODE,
+    bankAccount: env.VIETQR_BANK_ACCOUNT,
+    bankName: env.VIETQR_BANK_NAME,
+  };
+}
+
+// ── Router ────────────────────────────────────────────────────────────────────
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const store = new BillingStore(env.DB);
+
+    // ── Paddle ───────────────────────────────────────────────────────────────
+
+    if (request.method === "POST" && url.pathname === "/webhook/paddle") {
+      return handlePaddleWebhook(request, store, env.PADDLE_WEBHOOK_SECRET);
+    }
+
+    // ── Credits / usage ───────────────────────────────────────────────────────
+    //
+    // GUARDED AS A GROUP, and before the namespace is even read: every route below
+    // this line acts on an account named in the URL, so the question "may you ask
+    // about this account" has to be answered before the account is looked at.
+    const guarded = url.pathname === "/api/credits"
+      || url.pathname === "/api/usage"
+      || url.pathname.startsWith("/api/payment/get_qr_link/")
+      || url.pathname.startsWith("/api/payment/check_complete/");
+    if (guarded && !(await serverToServer(request, env))) {
+      return json({ error: "unauthorized" }, 401);
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/credits") {
+      const namespace = url.searchParams.get("namespace");
+      if (!namespace) return json({ error: "namespace required" }, 400);
+      return json(await store.getBillingInfo(namespace));
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/usage") {
+      const namespace = url.searchParams.get("namespace");
+      if (!namespace) return json({ error: "namespace required" }, 400);
+      return json(await store.getTransactionHistory(namespace));
+    }
+
+    // ── VietQR: get QR link ───────────────────────────────────────────────────
+    // GET /api/payment/get_qr_link/:namespace?tier=5
+
+    const qrMatch = url.pathname.match(/^\/api\/payment\/get_qr_link\/([^/]+)$/);
+    if (request.method === "GET" && qrMatch) {
+      const namespace = decodeURIComponent(qrMatch[1]);
+      const tierParam = Number(url.searchParams.get("tier"));
+      const tier = TIERS[tierParam];
+      if (!tier) return json({ error: "invalid tier (valid: 5, 10, 20, 50)" }, 400);
+
+      const orderId = `${namespace}:${tierParam}`;
+
+      // Return existing unexpired unpaid order if present
+      const existing = await store.getVietQROrder(orderId);
+      if (existing && !existing.paid && !isExpired(existing.created_at) && existing.qr_link) {
+        return json({ qr_link: existing.qr_link });
+      }
+
+      // Create new order
+      await store.createVietQROrder(orderId, namespace, tierParam, tier.amountVnd, tier.credits);
+
+      try {
+        const cfg = vietqrCfg(env);
+        const { qrLink } = await generateQR(cfg, orderId, tier.amountVnd);
+        await store.setVietQRQrLink(orderId, qrLink);
+        return json({ qr_link: qrLink });
+      } catch (err) {
+        return json({ error: String(err) }, 502);
+      }
+    }
+
+    // ── VietQR: poll for payment completion ────────────────────────────────────
+    // GET /api/payment/check_complete/:namespace?tier=5
+
+    const checkMatch = url.pathname.match(/^\/api\/payment\/check_complete\/([^/]+)$/);
+    if (request.method === "GET" && checkMatch) {
+      const namespace = decodeURIComponent(checkMatch[1]);
+      const tierParam = Number(url.searchParams.get("tier"));
+      if (!TIERS[tierParam]) return json({ error: "invalid tier" }, 400);
+
+      const orderId = `${namespace}:${tierParam}`;
+      const order = await store.getVietQROrder(orderId);
+      if (!order) return json({ paid: false });
+      if (isExpired(order.created_at) && !order.paid) return json({ paid: false, expired: true });
+      return json({ paid: !!order.paid });
+    }
+
+    // ── VietQR: token endpoint (VietQR calls this before each callback) ────────
+    // POST /api/token_generate
+
+    if (request.method === "POST" && url.pathname === "/api/token_generate") {
+      const auth = request.headers.get("Authorization") || "";
+      if (!auth.startsWith("Basic ")) return json({ error: "unauthorized" }, 401);
+
+      const decoded = atob(auth.slice(6));
+      const [user, pass] = decoded.split(":", 2);
+      if (user !== env.VIETQR_CALLBACK_USERNAME || pass !== env.VIETQR_CALLBACK_PASSWORD) {
+        return json({ error: "invalid credentials" }, 401);
+      }
+
+      const token = await signJwt(user, env.VIETQR_JWT_SECRET, 300);
+      return json({ access_token: token, token_type: "Bearer", expires_in: "300" });
+    }
+
+    // ── VietQR: transaction callback (VietQR pushes confirmed payments here) ───
+    // POST /bank/api/transaction-sync
+
+    if (request.method === "POST" && url.pathname === "/bank/api/transaction-sync") {
+      const auth = request.headers.get("Authorization") || "";
+      const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+
+      if (!await verifyJwt(token, env.VIETQR_JWT_SECRET)) {
+        return json({ error: true, errorReason: "INVALID_TOKEN", toastMessage: "Invalid token", object: null }, 401);
+      }
+
+      let body: {
+        transactionid?: string; orderId?: string; amount?: number; bankaccount?: string;
+      };
+      try {
+        body = await request.json();
+      } catch {
+        return json({ error: true, errorReason: "INVALID_BODY", toastMessage: "Bad request", object: null }, 400);
+      }
+
+      const encodedOrderId = body.orderId || "";
+      if (!encodedOrderId) {
+        return json({ error: true, errorReason: "MISSING_ORDER_ID", toastMessage: "Missing orderId", object: null }, 400);
+      }
+
+      let orderId: string;
+      try {
+        orderId = decodeNamespace(encodedOrderId);
+      } catch {
+        return json({ error: true, errorReason: "INVALID_ORDER_ID", toastMessage: "Invalid orderId", object: null }, 400);
+      }
+
+      const txnId = body.transactionid || crypto.randomUUID();
+      const result = await store.markVietQRPaid(orderId, txnId);
+
+      if (!result) {
+        // Already paid or not found — still return success (idempotent)
+        return json({
+          error: false, errorReason: null,
+          toastMessage: "Already processed",
+          object: { reftransactionid: `${encodedOrderId}-OK` },
+        });
+      }
+
+      return json({
+        error: false, errorReason: null,
+        toastMessage: "Transaction processed successfully",
+        object: { reftransactionid: `${encodedOrderId}-OK` },
+      });
+    }
+
+    // ── Dev: simulate payment ─────────────────────────────────────────────────
+    // POST /api/test/simulate_payment  { namespace, tier }
+
+    if (request.method === "POST" && url.pathname === "/api/test/simulate_payment") {
+      // THIS ROUTE MINTS CREDITS, and it was deployed to production unauthenticated.
+      // It asks VietQR to fire a transaction callback for any namespace at any tier's
+      // amount; that callback lands on /bank/api/transaction-sync, which trusts it
+      // because it arrives from VietQR with a valid token. So the whole chain was
+      // reachable by anyone who could POST a JSON body.
+      //
+      // 404 RATHER THAN 403: a route that exists only in development should not
+      // announce itself in production. And it needs BOTH the flag and the
+      // server-to-server secret, because either alone is one mistake away from open.
+      if (env.ALLOW_TEST_PAYMENTS !== "yes" || !(await serverToServer(request, env))) {
+        return new Response("not found", { status: 404 });
+      }
+      let body: { namespace?: string; tier?: number };
+      try {
+        body = await request.json();
+      } catch {
+        return json({ error: "invalid body" }, 400);
+      }
+
+      const { namespace, tier: tierParam } = body;
+      if (!namespace || !tierParam) return json({ error: "namespace and tier required" }, 400);
+      const tier = TIERS[tierParam];
+      if (!tier) return json({ error: "invalid tier" }, 400);
+
+      const orderId = `${namespace}:${tierParam}`;
+      const encodedOrderId = encodeNamespace(orderId);
+
+      try {
+        await simulatePayment(vietqrCfg(env), encodedOrderId, tier.amountVnd);
+        return json({ ok: true, order_id: orderId, encoded: encodedOrderId });
+      } catch (err) {
+        return json({ error: String(err) }, 502);
+      }
+    }
+
+    // ── Auth stubs ────────────────────────────────────────────────────────────
+
+    if (request.method === "POST" && url.pathname === "/auth/token") {
+      return json({ error: "not implemented" }, 501);
+    }
+
+    if (request.method === "POST" && url.pathname === "/auth/rotate") {
+      return json({ error: "not implemented" }, 501);
+    }
+
+    return new Response("Not Found", { status: 404 });
+  },
+};
