@@ -100,6 +100,15 @@ async function serverToServer(request: Request, env: Env): Promise<boolean> {
   return sameSecret(got.slice(7), env.BILLING_SERVER_SECRET || "");
 }
 
+/** A JSON body, or null when there is not one. Callers decide what a missing body means. */
+async function readJson<T>(request: Request): Promise<T | null> {
+  try {
+    return (await request.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
 function vietqrCfg(env: Env): VietQRConfig {
   return {
     baseUrl: env.VIETQR_BASE_URL || "https://dev.vietqr.org",
@@ -163,6 +172,57 @@ export default {
       const namespace = url.searchParams.get("namespace");
       if (!namespace) return json({ error: "namespace required" }, 400);
       return json(await store.getTransactionHistory(namespace));
+    }
+
+    // ── The ledger (TC-27 S2) ─────────────────────────────────────────────────
+    //
+    // Guarded by the deny-by-default gate above without being named there, which is the
+    // whole point of inverting that list: a route added later is protected whether or not
+    // anyone remembered it. A spend route left open by an allow-list would have been far
+    // worse than the read hole that prompted the inversion.
+
+    // POST /v1/spend  {service, identity, amount, reason, ref?, idem_key}
+    if (request.method === "POST" && url.pathname === "/v1/spend") {
+      const b = await readJson<{
+        service?: string; identity?: string; amount?: number;
+        reason?: string; ref?: string; idem_key?: string;
+      }>(request);
+      const service = String(b?.service ?? "").trim();
+      const identity = String(b?.identity ?? "").trim();
+      const reason = String(b?.reason ?? "").trim();
+      const idem = String(b?.idem_key ?? "").trim();
+      if (!service || !identity || !reason || !idem) {
+        return json({ error: "service, identity, reason and idem_key are required" }, 400);
+      }
+      const account = await store.accountFor(service, identity);
+      const out = await store.spend({
+        accountId: account, service, amount: Number(b?.amount),
+        reason, ref: b?.ref ?? null, idemKey: idem,
+      });
+      if (!out.ok) {
+        // 402 for "you cannot afford it", 400 for "that is not an amount". A caller
+        // retrying the first is sensible; retrying the second is a bug.
+        return json({ error: out.error, balance: out.balance },
+                    out.error === "insufficient" ? 402 : 400);
+      }
+      return json({ ok: true, account, spent: out.spent, replayed: out.replayed,
+                    balances: await store.balances(account) });
+    }
+
+    // GET /v1/balance?service=&identity=  - per bucket, from the journal
+    if (request.method === "GET" && url.pathname === "/v1/balance") {
+      const service = (url.searchParams.get("service") ?? "").trim();
+      const identity = (url.searchParams.get("identity") ?? "").trim();
+      if (!service || !identity) return json({ error: "service and identity are required" }, 400);
+      const account = await store.accountFor(service, identity);
+      const buckets = await store.balances(account);
+      return json({
+        account, buckets,
+        // What this service may actually spend: unscoped credits plus its own scoped ones.
+        spendable: buckets
+          .filter((x) => x.scope === null || x.scope === service)
+          .reduce((n, x) => n + x.credits, 0),
+      });
     }
 
     // ── VietQR: get QR link ───────────────────────────────────────────────────

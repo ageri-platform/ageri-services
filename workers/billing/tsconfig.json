@@ -4,11 +4,14 @@
     "lib": ["ES2022"],
     "module": "ES2022",
     "moduleResolution": "bundler",
-    "types": ["@cloudflare/workers-types"],
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types"],
     "strict": true,
     "noUnusedLocals": true,
     "noImplicitReturns": true,
     "skipLibCheck": true
   },
-  "include": ["*.ts"]
+  // The Worker's own sources and its tests, NOT vitest.config.ts: that file runs in node
+  // and imports node:path and node:fs, which do not exist in the Workers lib this project
+  // typechecks against. Naming the sources rather than globbing "*.ts" is what keeps it out.
+  "include": ["index.ts", "store.ts", "paddle.ts", "vietqr.ts", "test"]
 }
