@@ -118,23 +118,39 @@ export default {
     const url = new URL(request.url);
     const store = new BillingStore(env.DB);
 
+    // ── The gate, and it is DENY BY DEFAULT ───────────────────────────────────
+    //
+    // The first version of this fix listed the four routes to protect. That is the
+    // shape that produced the hole it was fixing: a route added later is open until
+    // somebody remembers to add it to the list, and nobody ever does. So the list
+    // is inverted. Everything needs the server-to-server secret EXCEPT the paths
+    // named here, each of which carries its own proof and is called by somebody who
+    // cannot hold our secret:
+    //
+    //   /webhook/paddle            Paddle,  HMAC-verified inside
+    //   /api/token_generate        VietQR,  Basic against VIETQR_CALLBACK_*
+    //   /bank/api/transaction-sync VietQR,  Bearer JWT signed with VIETQR_JWT_SECRET
+    //   /auth/token, /auth/rotate  501 stubs, reachable so they can say so
+    //
+    // Adding a route now means it is guarded whether or not anyone thought about
+    // it, and exposing one is a deliberate edit to this list with a reason beside
+    // it. An unknown path answers 401 rather than 404, which is the right way round:
+    // a mistake becomes a refusal, never an opening.
+    const PUBLIC_PATHS = new Set([
+      "/webhook/paddle",
+      "/api/token_generate",
+      "/bank/api/transaction-sync",
+      "/auth/token",
+      "/auth/rotate",
+    ]);
+    if (!PUBLIC_PATHS.has(url.pathname) && !(await serverToServer(request, env))) {
+      return json({ error: "unauthorized" }, 401);
+    }
+
     // ── Paddle ───────────────────────────────────────────────────────────────
 
     if (request.method === "POST" && url.pathname === "/webhook/paddle") {
       return handlePaddleWebhook(request, store, env.PADDLE_WEBHOOK_SECRET);
-    }
-
-    // ── Credits / usage ───────────────────────────────────────────────────────
-    //
-    // GUARDED AS A GROUP, and before the namespace is even read: every route below
-    // this line acts on an account named in the URL, so the question "may you ask
-    // about this account" has to be answered before the account is looked at.
-    const guarded = url.pathname === "/api/credits"
-      || url.pathname === "/api/usage"
-      || url.pathname.startsWith("/api/payment/get_qr_link/")
-      || url.pathname.startsWith("/api/payment/check_complete/");
-    if (guarded && !(await serverToServer(request, env))) {
-      return json({ error: "unauthorized" }, 401);
     }
 
     if (request.method === "GET" && url.pathname === "/api/credits") {
@@ -275,9 +291,9 @@ export default {
       // reachable by anyone who could POST a JSON body.
       //
       // 404 RATHER THAN 403: a route that exists only in development should not
-      // announce itself in production. And it needs BOTH the flag and the
-      // server-to-server secret, because either alone is one mistake away from open.
-      if (env.ALLOW_TEST_PAYMENTS !== "yes" || !(await serverToServer(request, env))) {
+      // announce itself in production. The secret is already required by the
+      // deny-by-default gate above, so this is the second of the two locks.
+      if (env.ALLOW_TEST_PAYMENTS !== "yes") {
         return new Response("not found", { status: 404 });
       }
       let body: { namespace?: string; tier?: number };
