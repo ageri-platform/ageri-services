@@ -263,6 +263,28 @@ export default {
                     links: await store.linksOf(out.account) });
     }
 
+    // POST /v1/link/forget  {service, identity}  - that service erased the person
+    //
+    // ERASURE MEETS AN APPEND-ONLY JOURNAL HERE, and the resolution is to delete the DOOR and
+    // keep the ROWS: transaction records must be kept for years by law, which outranks an
+    // erasure request for them, while the link is what ties them to a person. Afterwards the
+    // journal holds money facts against a `ca_` id that names nobody.
+    //
+    // NOT A SPEND AND NOT A REFUND. Credits are non-refundable by policy, and the service
+    // calling this has already told its customer the balance is forfeited; zeroing the buckets
+    // here would rewrite the journal, which is the one thing it does not allow.
+    if (request.method === "POST" && url.pathname === "/v1/link/forget") {
+      const b = await readJson<{ service?: string; identity?: string }>(request);
+      const service = String(b?.service ?? "").trim();
+      const identity = String(b?.identity ?? "").trim();
+      if (!service || !identity) return json({ error: "service and identity are required" }, 400);
+      const account = await store.forgetLink(service, identity);
+      // IDEMPOTENT ON PURPOSE, and it says which happened. The caller is a finaliser that may
+      // retry after a failure elsewhere, and a 404 for "already forgotten" would stop it
+      // finishing a deletion that is genuinely complete on this side.
+      return json({ ok: true, forgotten: account !== null, account });
+    }
+
     // GET /v1/links?service=&identity=  - the doors into this account, never a code
     if (request.method === "GET" && url.pathname === "/v1/links") {
       const service = (url.searchParams.get("service") ?? "").trim();

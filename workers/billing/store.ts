@@ -271,6 +271,33 @@ export class BillingStore {
   }
 
   /**
+   * FORGET A SERVICE'S DOOR INTO AN ACCOUNT, AND KEEP THE MONEY FACTS. Called when that
+   * service erases the person (terminal-accounts TC-28 S3): tax and accounting law require
+   * transaction records to be kept for years, which overrides an erasure request for those
+   * rows - so the `entry` journal stays exactly as it is and only the LINK goes.
+   *
+   * What that leaves behind is the point: money facts hanging off a `ca_` id that names
+   * nobody. The books stay true and the person leaves them. That the ledger owns its own
+   * identifier and every service reaches it through a link is what makes erasure tractable
+   * at all; a wallet keyed by the service's user id could not be done.
+   *
+   * NOT accountFor(), which CREATES a link on first sight - asking it about somebody who was
+   * never here would mint the very row this is meant to remove. Returns the account the link
+   * pointed at, or null when there was nothing to forget, so a repeat is honest rather than
+   * pretending to have done something.
+   *
+   * THE credit_account ROW IS DELIBERATELY LEFT. Its entries still reference it, and deleting
+   * it would either fail on the reference or orphan the journal; it holds no personal data.
+   */
+  async forgetLink(service: string, identityId: string): Promise<string | null> {
+    const row = await this.db
+      .prepare("DELETE FROM account_link WHERE service = ? AND service_identity_id = ? RETURNING account_id")
+      .bind(service, identityId)
+      .first<{ account_id: string }>();
+    return row?.account_id ?? null;
+  }
+
+  /**
    * What this account holds, per bucket, as a GROUP BY over the journal rather than a
    * column. Credits do not expire (huy, 2026-09-27), so same kind and scope are fungible
    * and there is nothing to track per grant - which is what deleted lot tracking entirely.

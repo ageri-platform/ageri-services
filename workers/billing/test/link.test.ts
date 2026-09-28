@@ -227,3 +227,61 @@ describe("merging two balances", () => {
     expect(total(await store.balances(target))).toBe(700);
   });
 });
+
+// ── Forgetting a door, and keeping the books (terminal-accounts TC-28 S3) ─────
+//
+// The erasure question with a real answer: tax and accounting law require transaction records
+// to be kept for years, which overrides an erasure request for those rows. So the link goes and
+// the journal stays, leaving money facts against a `ca_` id that names nobody.
+describe("forgetting a service's door into an account", () => {
+  it("removes the link and leaves every journal row where it was", async () => {
+    const { id, account } = await withCredits("terminal-connect", [{ credits: 700 }]);
+    const before = await env.DB.prepare("SELECT COUNT(*) AS n FROM entry WHERE account_id = ?")
+      .bind(account).first<{ n: number }>();
+    expect(before!.n).toBeGreaterThan(0);
+
+    expect(await store.forgetLink("terminal-connect", id)).toBe(account);
+
+    const link = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM account_link WHERE service = ? AND service_identity_id = ?",
+    ).bind("terminal-connect", id).first<{ n: number }>();
+    expect(link!.n).toBe(0);
+    const after = await env.DB.prepare("SELECT COUNT(*) AS n FROM entry WHERE account_id = ?")
+      .bind(account).first<{ n: number }>();
+    expect(after!.n).toBe(before!.n);
+    // The money is still there, and still adds up: nothing was refunded or zeroed, because
+    // rewriting the journal is the one thing this table does not allow.
+    expect(total(await store.balances(account))).toBe(700);
+  });
+
+  it("leaves another service's door into the same account alone", async () => {
+    const { id, account } = await withCredits("ageri", [{ credits: 100 }]);
+    const { code } = await store.mintLinkCode(account, "ageri");
+    const joined = who();
+    expect((await store.redeemLinkCode(code, "terminal-connect", joined)).ok).toBe(true);
+
+    expect(await store.forgetLink("terminal-connect", joined)).toBe(account);
+    // ONE PERSON LEAVING ONE SERVICE IS NOT THE ACCOUNT BEING DELETED. The Ageri door into the
+    // same balance has to survive, or erasing on one service would take somebody's money away
+    // on another.
+    expect((await store.linksOf(account)).map((l) => l.service)).toEqual(["ageri"]);
+    expect(total(await store.balances(account))).toBe(100);
+  });
+
+  // IDEMPOTENT, because the caller is a finaliser that may retry after a failure elsewhere.
+  it("says so rather than failing when there was nothing to forget", async () => {
+    expect(await store.forgetLink("terminal-connect", who())).toBeNull();
+  });
+
+  // AND IT MUST NOT MINT WHAT IT IS ASKED TO REMOVE. accountFor() creates a link on first
+  // sight; reaching for it here would leave a brand new row behind for somebody who was never
+  // a customer, which is the opposite of erasure.
+  it("creates nothing for an identity that was never here", async () => {
+    const stranger = who();
+    await store.forgetLink("terminal-connect", stranger);
+    const link = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM account_link WHERE service_identity_id = ?",
+    ).bind(stranger).first<{ n: number }>();
+    expect(link!.n).toBe(0);
+  });
+});
