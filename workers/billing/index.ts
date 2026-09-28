@@ -216,6 +216,62 @@ export default {
                     balances: await store.balances(account) });
     }
 
+    // ── Linking: one holder, one balance, several doors (TC-27 S1b) ───────────
+    //
+    // BOTH ROUTES SIT BEHIND THE DENY-BY-DEFAULT GATE without being named in it, which is
+    // exactly why that list was inverted: a route added later is protected by forgetting
+    // rather than exposed by it. Neither is reachable by a browser - a SERVICE calls them
+    // on behalf of somebody it has already authenticated, and the identity in the body is
+    // that service's own, which it knows and the user cannot choose.
+
+    // POST /v1/link/start  {service, identity}  -> a code to carry to the other service
+    if (request.method === "POST" && url.pathname === "/v1/link/start") {
+      const b = await readJson<{ service?: string; identity?: string; ttl?: number }>(request);
+      const service = String(b?.service ?? "").trim();
+      const identity = String(b?.identity ?? "").trim();
+      if (!service || !identity) return json({ error: "service and identity are required" }, 400);
+      const account = await store.accountFor(service, identity);
+      // A ceiling on the TTL, not a free choice: this is a bearer credential for somebody's
+      // money, and a caller asking for a week should not get one.
+      const ttl = Math.min(Math.max(Number(b?.ttl) || 900, 60), 3600);
+      const { code, expiresAt } = await store.mintLinkCode(account, service, ttl);
+      // THE CODE IS RETURNED ONCE AND NEVER STORED IN THE CLEAR. There is deliberately no
+      // route that reads it back - a "show me my code again" endpoint would turn a leaked
+      // session into a leaked wallet.
+      return json({ ok: true, code, expires_at: expiresAt, account });
+    }
+
+    // POST /v1/link/redeem  {code, service, identity}
+    if (request.method === "POST" && url.pathname === "/v1/link/redeem") {
+      const b = await readJson<{ code?: string; service?: string; identity?: string }>(request);
+      const code = String(b?.code ?? "").trim().toUpperCase();
+      const service = String(b?.service ?? "").trim();
+      const identity = String(b?.identity ?? "").trim();
+      if (!code || !service || !identity) {
+        return json({ error: "code, service and identity are required" }, 400);
+      }
+      const out = await store.redeemLinkCode(code, service, identity);
+      if (!out.ok) {
+        // 410 for a code that WAS real and is now spent or stale, 404 for one that never
+        // existed. A person who mistyped and a person whose code lapsed need different
+        // advice, and collapsing both into 400 would deny them it.
+        const status = out.error === "no_such_code" ? 404 : 410;
+        return json({ error: out.error }, status);
+      }
+      return json({ ok: true, account: out.account, merged: out.merged,
+                    balances: await store.balances(out.account),
+                    links: await store.linksOf(out.account) });
+    }
+
+    // GET /v1/links?service=&identity=  - the doors into this account, never a code
+    if (request.method === "GET" && url.pathname === "/v1/links") {
+      const service = (url.searchParams.get("service") ?? "").trim();
+      const identity = (url.searchParams.get("identity") ?? "").trim();
+      if (!service || !identity) return json({ error: "service and identity are required" }, 400);
+      const account = await store.accountFor(service, identity);
+      return json({ account, links: await store.linksOf(account) });
+    }
+
     // GET /v1/balance?service=&identity=&resource=  - per bucket, from the journal
     if (request.method === "GET" && url.pathname === "/v1/balance") {
       const service = (url.searchParams.get("service") ?? "").trim();

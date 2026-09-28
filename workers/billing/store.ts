@@ -24,6 +24,19 @@ export interface TransactionRecord {
 export type CreditKind = "purchased" | "promotional" | "earned";
 
 /**
+ * Hex SHA-256, for storing a link code as a digest rather than as itself.
+ *
+ * NOT constant-time, and it does not need to be: this hashes a code to LOOK IT UP by primary
+ * key, so the comparison happens inside SQLite on a value an attacker would have to guess in
+ * full. The secret comparison in index.ts is the one that needs equal-length digest
+ * compare, because there the attacker supplies one side and watches how long we take.
+ */
+async function sha256Hex(s: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
  * THE ORDER A CHARGE DRAWS IN: least valuable to the holder first. `promotional` is a
  * marketing expense that is never withdrawable, `purchased` is money handed over, and
  * `earned` is money we owe an author and the only kind that can leave as cash.
@@ -357,6 +370,140 @@ export class BillingStore {
             opts.service ?? null, opts.reason, opts.ref ?? null, opts.idemKey)
       .run();
     return (done.meta.changes ?? 0) > 0;
+  }
+
+  // ── Linking: one holder, one balance, several doors (TC-27 S1b) ──────────────
+  //
+  // `accountFor` is right on first sight of a stranger and wrong for ever after: it mints a
+  // separate account per (service, identity), so one person signing into two services owns
+  // two islands. Linking is how they become one, and it is a DELIBERATE ACT - a matching
+  // name or email is a coincidence, not evidence, which is the collision migration 0003
+  // exists to prevent.
+
+  /**
+   * Mint a link code for an account. SHORT-LIVED, SINGLE-USE, STORED AS A HASH.
+   *
+   * Whoever redeems this gains a door into the account's money, so it is a bearer credential
+   * and gets the same treatment as one: the plaintext is returned once, to the caller, and
+   * only the digest is kept. A leaked backup of `link_code` must not be a pile of working
+   * codes.
+   *
+   * The alphabet omits I, O, 0 and 1 because somebody reads this aloud or retypes it from
+   * another screen, which is the whole situation it exists for.
+   */
+  async mintLinkCode(accountId: string, issuedBy: string, ttlSeconds = 900): Promise<{ code: string; expiresAt: number }> {
+    const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    const bytes = crypto.getRandomValues(new Uint8Array(10));
+    const code = [...bytes].map((b) => ALPHABET[b % ALPHABET.length]).join("");
+    const nowS = Math.floor(Date.now() / 1000);
+    const expiresAt = nowS + ttlSeconds;
+    await this.db
+      .prepare(`INSERT INTO link_code (code_hash, account_id, issued_by, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?)`)
+      .bind(await sha256Hex(code), accountId, issuedBy, nowS, expiresAt)
+      .run();
+    return { code, expiresAt };
+  }
+
+  /**
+   * Redeem a link code: point `service`/`identityId` at the code's account, moving any money
+   * that identity already had.
+   *
+   * THE MERGE RULE IS THAT THE JOURNAL IS NEVER REWRITTEN. Repointing a link is lossless only
+   * when the redeeming identity's own account is empty. When it holds money, the balance is
+   * moved as NEW ENTRIES - per (kind, scope) bucket, a `merge_out` on the source and a
+   * matching `merge_in` on the target - so kind and scope survive (promotional stays
+   * promotional, a namespace-scoped gift stays namespace-scoped) and both histories read
+   * correctly afterwards. Re-keying `entry.account_id` with an UPDATE would be rewriting an
+   * append-only financial table, which is the thing 0003 was written to never need again.
+   *
+   * IDEMPOTENT THE SAME WAY A CHARGE IS: every leg shares one key derived from the code, so a
+   * retry after a dropped response cannot move the money twice - and `entry_idem` enforces
+   * that in SQLite rather than here.
+   */
+  async redeemLinkCode(code: string, service: string, identityId: string): Promise<
+    | { ok: true; account: string; merged: { kind: string; scope: string | null; credits: number }[] }
+    | { ok: false; error: "no_such_code" | "expired" | "already_used" | "already_linked" }
+  > {
+    const hash = await sha256Hex(code);
+    const row = await this.db
+      .prepare("SELECT account_id, expires_at, redeemed_at FROM link_code WHERE code_hash = ?")
+      .bind(hash)
+      .first<{ account_id: string; expires_at: number; redeemed_at: number | null }>();
+    if (!row) return { ok: false, error: "no_such_code" };
+    // ALREADY USED IS CHECKED BEFORE EXPIRED, because a redeemed code will also be expired
+    // eventually and "you already used this" is the more useful of the two true answers.
+    if (row.redeemed_at) return { ok: false, error: "already_used" };
+    if (row.expires_at <= Math.floor(Date.now() / 1000)) return { ok: false, error: "expired" };
+
+    const target = row.account_id;
+    const existing = await this.db
+      .prepare("SELECT account_id FROM account_link WHERE service = ? AND service_identity_id = ?")
+      .bind(service, identityId)
+      .first<{ account_id: string }>();
+
+    // ALREADY THERE. Not an error worth undoing anything for, but not silently "ok" either:
+    // a caller retrying a redeem it already completed gets a truthful no-op below, while a
+    // SECOND identity of the same service trying to join is refused - a service reaches an
+    // account through exactly one identity, or "which one is you" has no answer.
+    if (existing?.account_id === target) {
+      await this.markRedeemed(hash, service);
+      return { ok: true, account: target, merged: [] };
+    }
+
+    const merged: { kind: string; scope: string | null; credits: number }[] = [];
+    const stmts: D1PreparedStatement[] = [];
+    if (existing) {
+      const source = existing.account_id;
+      for (const b of await this.balances(source)) {
+        if (b.credits <= 0) continue;   // a negative bucket is not money to carry over
+        merged.push(b);
+        const key = `merge:${hash}:${b.kind}:${b.scope ?? ""}`;
+        stmts.push(
+          this.db.prepare(`INSERT INTO entry (account_id, delta, kind, scope, service, reason, ref, idem_key)
+                           VALUES (?, ?, ?, ?, ?, 'merge_out', ?, ?)`)
+            .bind(source, -b.credits, b.kind, b.scope, service, target, `${key}:out`),
+          this.db.prepare(`INSERT INTO entry (account_id, delta, kind, scope, service, reason, ref, idem_key)
+                           VALUES (?, ?, ?, ?, ?, 'merge_in', ?, ?)`)
+            .bind(target, b.credits, b.kind, b.scope, service, source, `${key}:in`),
+        );
+      }
+      stmts.push(
+        this.db.prepare("UPDATE account_link SET account_id = ? WHERE service = ? AND service_identity_id = ?")
+          .bind(target, service, identityId),
+      );
+    } else {
+      stmts.push(
+        this.db.prepare(`INSERT INTO account_link (service, service_identity_id, account_id)
+                         VALUES (?, ?, ?)`)
+          .bind(service, identityId, target),
+      );
+    }
+    stmts.push(
+      this.db.prepare("UPDATE link_code SET redeemed_at = ?, redeemed_by = ? WHERE code_hash = ?")
+        .bind(Math.floor(Date.now() / 1000), service, hash),
+    );
+
+    // ONE BATCH: the money, the door and the spent code move together or not at all. A link
+    // that landed without its entries would be the worst outcome available here.
+    await this.db.batch(stmts);
+    return { ok: true, account: target, merged };
+  }
+
+  private async markRedeemed(hash: string, service: string): Promise<void> {
+    await this.db
+      .prepare("UPDATE link_code SET redeemed_at = ?, redeemed_by = ? WHERE code_hash = ? AND redeemed_at IS NULL")
+      .bind(Math.floor(Date.now() / 1000), service, hash)
+      .run();
+  }
+
+  /** Every door into an account, for a "linked services" screen. Never a code. */
+  async linksOf(accountId: string): Promise<{ service: string; service_identity_id: string; granted_at: string }[]> {
+    const { results } = await this.db
+      .prepare("SELECT service, service_identity_id, granted_at FROM account_link WHERE account_id = ? ORDER BY granted_at")
+      .bind(accountId)
+      .all<{ service: string; service_identity_id: string; granted_at: string }>();
+    return results;
   }
 
   // ── VietQR orders ───────────────────────────────────────────────────────────
