@@ -17,7 +17,7 @@
  *   POST /auth/rotate        — Rotate expiring subkey
  */
 
-import { BillingStore, scopeMatches } from "./store";
+import { BillingStore } from "./store";
 import { handlePaddleWebhook } from "./paddle";
 import {
   TIERS, encodeNamespace, decodeNamespace,
@@ -282,13 +282,12 @@ export default {
       const buckets = await store.balances(account);
       return json({
         account, buckets,
-        // WHAT THIS CALLER COULD ACTUALLY SPEND, answered with `scopeMatches` - the same
-        // function `spend()` enforces, imported rather than reimplemented. A second copy of
-        // the rule would drift, and the failure would be a balance screen promising credits
-        // that the charge then refuses.
-        spendable: buckets
-          .filter((x) => scopeMatches(x.scope, service, resource))
-          .reduce((n, x) => n + x.credits, 0),
+        // WHAT THIS CALLER COULD ACTUALLY SPEND, answered by the store with the same two
+        // rules the charge enforces - scope AND the area's policy. It used to be summed here
+        // with a copy of the scope rule, which was already one copy too many; adding the
+        // policy would have made it two, and the failure mode is a balance screen promising
+        // credits that the charge then refuses.
+        spendable: await store.spendable(account, service, resource),
       });
     }
 

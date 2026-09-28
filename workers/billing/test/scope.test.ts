@@ -101,11 +101,36 @@ describe("a grant that may only buy one thing", () => {
     if (!out.ok) expect(out.balance).toBe(0);
   });
 
-  it("still lets a service-wide grant buy anything in that service", async () => {
+  // THE AREA HAS THE LAST WORD, WHICH IS THE POINT OF HAVING BOTH RULES. This grant is scoped
+  // to the whole of terminal-connect, so `scopeMatches` is perfectly happy with a marketplace
+  // purchase - and it is still refused, because the marketplace does not accept promotional
+  // money at all. A grant issued too wide cannot settle an author's invoice.
+  it("refuses a service-wide GIFT in an area that takes no gifts", async () => {
     const account = await granted("terminal-connect");
     const out = await store.spend({
       accountId: account, service: "terminal-connect", resource: "marketplace",
       amount: 300, reason: "tool_purchase", idemKey: who() });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out).toMatchObject({ error: "insufficient", balance: 0 });
+  });
+
+  it("...but the same grant buys in an area that does", async () => {
+    const account = await granted("terminal-connect");
+    const out = await store.spend({
+      accountId: account, service: "terminal-connect", resource: "namespace",
+      amount: 300, reason: "namespace_block", idemKey: who() });
+    expect(out.ok).toBe(true);
+    if (out.ok) expect(out.spent).toEqual([{ kind: "promotional", credits: 300 }]);
+  });
+
+  // PURCHASED MONEY NEEDS NOBODY'S PERMISSION. The default denies only the gift, so an area
+  // nobody has declared still takes the customer's own money - otherwise deny-by-default
+  // would have broken every existing charge rather than only the ones it means to.
+  it("lets purchased credits buy in an area with no policy at all", async () => {
+    const account = await granted("terminal-connect:widgets", 500, "purchased");
+    const out = await store.spend({
+      accountId: account, service: "terminal-connect", resource: "widgets",
+      amount: 500, reason: "widget", idemKey: who() });
     expect(out.ok).toBe(true);
   });
 });
@@ -143,7 +168,7 @@ describe("the order a charge draws in", () => {
       await store.grant({ accountId: account, credits: 100, kind, reason: "seed", idemKey: who() });
     }
     const out = await store.spend({
-      accountId: account, service: "terminal-connect", amount: 250,
+      accountId: account, service: "terminal-connect", resource: "namespace", amount: 250,
       reason: "namespace_block", idemKey: who() });
     expect(out.ok).toBe(true);
     if (out.ok) {

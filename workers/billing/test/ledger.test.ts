@@ -63,8 +63,8 @@ describe("spending", () => {
       { credits: 30, kind: "promotional" },
     ]);
     const out = await store.spend({
-      accountId: account, service: "ageri", amount: 50,
-      reason: "namespace_year", idemKey: who(),
+      accountId: account, service: "ageri", resource: "llm", amount: 50,
+      reason: "llm_call", idemKey: who(),
     });
     expect(out.ok).toBe(true);
     if (!out.ok) return;
@@ -124,12 +124,12 @@ describe("spending", () => {
                         scope: "terminal-connect", reason: "signup_grant", idemKey: who() });
 
     const wrong = await store.spend({
-      accountId: account, service: "ageri", amount: 100, reason: "llm", idemKey: who() });
+      accountId: account, service: "ageri", resource: "llm", amount: 100, reason: "llm", idemKey: who() });
     expect(wrong.ok).toBe(false);
     if (!wrong.ok) expect(wrong.balance).toBe(0);
 
     const right = await store.spend({
-      accountId: account, service: "terminal-connect", amount: 100,
+      accountId: account, service: "terminal-connect", resource: "namespace", amount: 100,
       reason: "namespace_year", idemKey: who() });
     expect(right.ok).toBe(true);
     if (right.ok) expect(right.spent).toEqual([{ kind: "promotional", credits: 100 }]);
@@ -144,7 +144,7 @@ describe("spending", () => {
     await store.grant({ accountId: account, credits: 50, kind: "promotional",
                         reason: "unscoped", idemKey: who() });
     const out = await store.spend({
-      accountId: account, service: "ageri", amount: 60, reason: "x", idemKey: who() });
+      accountId: account, service: "ageri", resource: "llm", amount: 60, reason: "x", idemKey: who() });
     expect(out.ok).toBe(true);
     const left = await store.balances(account);
     // 50 scoped gone entirely, 10 taken from the unscoped one.
@@ -163,7 +163,7 @@ describe("spending", () => {
     await store.grant({ accountId: account, credits: 3000, kind: "purchased",
                         reason: "topup", idemKey: who() });
     const out = await store.spend({
-      accountId: account, service: "terminal-connect", amount: 3650,
+      accountId: account, service: "terminal-connect", resource: "namespace", amount: 3650,
       reason: "namespace_year", ref: "huy.terminalconnect.ai", idemKey: who() });
     expect(out.ok).toBe(true);
     if (out.ok) {

@@ -45,6 +45,13 @@ async function sha256Hex(s: string): Promise<string> {
  * the journal grew a value this array has not heard of would be the worse failure: the
  * money is still there, and the only thing at stake is which bucket goes first.
  */
+/**
+ * WHAT AN UNDECLARED AREA ACCEPTS: everything except a gift. Purchased is the customer's own
+ * money and earned is money we owe them, so neither needs an area's permission; promotional
+ * is ours to give and therefore ours to restrict. See migration 0006.
+ */
+const DEFAULT_KINDS: readonly string[] = ["purchased", "earned"];
+
 const SPEND_ORDER: readonly string[] = ["promotional", "purchased", "earned"];
 const spendRank = (kind: string): number => {
   const i = SPEND_ORDER.indexOf(kind);
@@ -199,6 +206,40 @@ export class BillingStore {
   // been granted and never once consumed. Everything the product decided to sell - a
   // namespace year, a licence, seats - had no row shape to live in.
 
+  /**
+   * WHICH KINDS OF MONEY THIS AREA ACCEPTS. An absent row means the DEFAULT, which is
+   * everything except promotional - so an area nobody has declared refuses a gift, and
+   * forgetting produces a refusal rather than an opening. That is the same inversion that
+   * turned the `/api/credits` hole from a permanent hazard into a one-time fix.
+   *
+   * A SPEND THAT DECLARES NO RESOURCE HAS NO AREA, and so gets the default too. Absence is
+   * meaningful here exactly as it is in `scopeMatches`: a caller that will not say what it is
+   * buying is given the narrowest thing that could be true, never the widest.
+   */
+  private async acceptedKinds(service: string, resource?: string | null): Promise<Set<string>> {
+    if (!resource) return new Set(DEFAULT_KINDS);
+    const row = await this.db
+      .prepare("SELECT kinds FROM area_policy WHERE service = ? AND resource = ?")
+      .bind(service, resource)
+      .first<{ kinds: string }>();
+    if (!row) return new Set(DEFAULT_KINDS);
+    // Parsed defensively: a row that somehow says nothing must not mean "accepts everything".
+    const kinds = row.kinds.split(",").map((k) => k.trim()).filter(Boolean);
+    return new Set(kinds.length ? kinds : DEFAULT_KINDS);
+  }
+
+  /**
+   * What a caller could actually spend here, answered with the SAME two rules the charge
+   * enforces. `/v1/balance` uses this rather than summing buckets itself, because a balance
+   * screen promising credits that the charge then refuses is worse than no screen.
+   */
+  async spendable(accountId: string, service: string, resource?: string | null): Promise<number> {
+    const accepted = await this.acceptedKinds(service, resource);
+    return (await this.balances(accountId))
+      .filter((b) => b.credits > 0 && accepted.has(b.kind) && scopeMatches(b.scope, service, resource))
+      .reduce((n, b) => n + b.credits, 0);
+  }
+
   /** The account a service's identity reaches, created on first sight. */
   async accountFor(service: string, identityId: string): Promise<string> {
     const found = await this.db
@@ -254,14 +295,20 @@ export class BillingStore {
    *
    * A GRANT IS ONLY VISIBLE TO WHAT IT WAS SCOPED TO, and `scope` is MATCHED rather than
    * compared, so one column expresses three widths - see `scopeMatches`.
+   *
+   * AND THE AREA HAS A SAY TOO. `accepted` comes from `area_policy` and is the same rule from
+   * the other end: scope guards against a grant issued too wide, the policy guards against an
+   * area that should never see a gift at all. A mis-scoped promotional grant still cannot pay
+   * a marketplace author, because the marketplace does not accept that kind of money.
    */
   private eligible(
     rows: { kind: string; scope: string | null; credits: number }[],
     service: string,
-    resource?: string | null,
+    resource: string | null | undefined,
+    accepted: Set<string>,
   ) {
     return rows
-      .filter((r) => r.credits > 0 && scopeMatches(r.scope, service, resource))
+      .filter((r) => r.credits > 0 && accepted.has(r.kind) && scopeMatches(r.scope, service, resource))
       .sort((a, b) => {
         const byKind = spendRank(a.kind) - spendRank(b.kind);
         if (byKind !== 0) return byKind;
@@ -315,7 +362,8 @@ export class BillingStore {
     }
 
     const rows = await this.balances(accountId);
-    const buckets = this.eligible(rows, service, opts.resource ?? null);
+    const buckets = this.eligible(rows, service, opts.resource ?? null,
+                                  await this.acceptedKinds(service, opts.resource));
     const available = buckets.reduce((n, b) => n + b.credits, 0);
     if (available < amount) return { ok: false, error: "insufficient", balance: available };
 
