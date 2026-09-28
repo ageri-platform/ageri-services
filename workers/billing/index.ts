@@ -17,7 +17,7 @@
  *   POST /auth/rotate        — Rotate expiring subkey
  */
 
-import { BillingStore } from "./store";
+import { BillingStore, scopeMatches } from "./store";
 import { handlePaddleWebhook } from "./paddle";
 import {
   TIERS, encodeNamespace, decodeNamespace,
@@ -181,23 +181,30 @@ export default {
     // anyone remembered it. A spend route left open by an allow-list would have been far
     // worse than the read hole that prompted the inversion.
 
-    // POST /v1/spend  {service, identity, amount, reason, ref?, idem_key}
+    // POST /v1/spend  {service, identity, amount, reason, resource?, ref?, idem_key}
+    //
+    // `resource` is optional and its ABSENCE IS MEANINGFUL: a spend that does not say what
+    // it is buying cannot reach a bucket scoped `service:resource`. That is the safe
+    // default - a narrow grant stays invisible until a caller declares a purpose - so this
+    // stays optional rather than becoming required, and old callers keep working with the
+    // narrowest possible access instead of the widest.
     if (request.method === "POST" && url.pathname === "/v1/spend") {
       const b = await readJson<{
         service?: string; identity?: string; amount?: number;
-        reason?: string; ref?: string; idem_key?: string;
+        reason?: string; resource?: string; ref?: string; idem_key?: string;
       }>(request);
       const service = String(b?.service ?? "").trim();
       const identity = String(b?.identity ?? "").trim();
       const reason = String(b?.reason ?? "").trim();
       const idem = String(b?.idem_key ?? "").trim();
+      const resource = String(b?.resource ?? "").trim() || null;
       if (!service || !identity || !reason || !idem) {
         return json({ error: "service, identity, reason and idem_key are required" }, 400);
       }
       const account = await store.accountFor(service, identity);
       const out = await store.spend({
         accountId: account, service, amount: Number(b?.amount),
-        reason, ref: b?.ref ?? null, idemKey: idem,
+        reason, resource, ref: b?.ref ?? null, idemKey: idem,
       });
       if (!out.ok) {
         // 402 for "you cannot afford it", 400 for "that is not an amount". A caller
@@ -209,18 +216,22 @@ export default {
                     balances: await store.balances(account) });
     }
 
-    // GET /v1/balance?service=&identity=  - per bucket, from the journal
+    // GET /v1/balance?service=&identity=&resource=  - per bucket, from the journal
     if (request.method === "GET" && url.pathname === "/v1/balance") {
       const service = (url.searchParams.get("service") ?? "").trim();
       const identity = (url.searchParams.get("identity") ?? "").trim();
+      const resource = (url.searchParams.get("resource") ?? "").trim() || null;
       if (!service || !identity) return json({ error: "service and identity are required" }, 400);
       const account = await store.accountFor(service, identity);
       const buckets = await store.balances(account);
       return json({
         account, buckets,
-        // What this service may actually spend: unscoped credits plus its own scoped ones.
+        // WHAT THIS CALLER COULD ACTUALLY SPEND, answered with `scopeMatches` - the same
+        // function `spend()` enforces, imported rather than reimplemented. A second copy of
+        // the rule would drift, and the failure would be a balance screen promising credits
+        // that the charge then refuses.
         spendable: buckets
-          .filter((x) => x.scope === null || x.scope === service)
+          .filter((x) => scopeMatches(x.scope, service, resource))
           .reduce((n, x) => n + x.credits, 0),
       });
     }

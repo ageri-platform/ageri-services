@@ -20,6 +20,61 @@ export interface TransactionRecord {
   created_at: string;
 }
 
+/** The kinds of credit the journal admits. Enforced by a CHECK, not by this type. */
+export type CreditKind = "purchased" | "promotional" | "earned";
+
+/**
+ * THE ORDER A CHARGE DRAWS IN: least valuable to the holder first. `promotional` is a
+ * marketing expense that is never withdrawable, `purchased` is money handed over, and
+ * `earned` is money we owe an author and the only kind that can leave as cash.
+ *
+ * A kind not named here sorts LAST rather than throwing. A charge refusing to run because
+ * the journal grew a value this array has not heard of would be the worse failure: the
+ * money is still there, and the only thing at stake is which bucket goes first.
+ */
+const SPEND_ORDER: readonly string[] = ["promotional", "purchased", "earned"];
+const spendRank = (kind: string): number => {
+  const i = SPEND_ORDER.indexOf(kind);
+  return i < 0 ? SPEND_ORDER.length : i;
+};
+
+/**
+ * HOW WIDE A BUCKET IS, and so how late it should be spent. NULL spends anywhere (widest),
+ * a bare service name spends anywhere in that service, `service:resource` spends on one
+ * thing (narrowest).
+ */
+const scopeWidth = (scope: string | null): number =>
+  scope === null ? 2 : scope.includes(":") ? 0 : 1;
+
+/**
+ * May a bucket with this `scope` pay for `resource` in `service`?
+ *
+ * ONE COLUMN, THREE WIDTHS. `null` matches everything. `"terminal-connect"` matches any
+ * spend by that service. `"terminal-connect:namespace"` matches only a spend that DECLARED
+ * it was buying a namespace - and a spend that declares nothing cannot touch it, which is
+ * the point: the narrow grant is invisible until a caller says what the money is for.
+ *
+ * WHY THE FINE CASE EXISTS (huy, 2026-09-28: "promotional credits should be used for the
+ * namespace area only"). A service name is too coarse, because seats, licences and the
+ * marketplace all live inside terminal-connect as well. And the marketplace is the case
+ * that matters: an MCP tool author is paid real money, so a promotional credit spent there
+ * is a third party's invoice settled out of a grant we think of as marketing. The rule is
+ * "promotional credits may buy OUR resources, never a third party's labour", and this
+ * function is where that rule is actually said.
+ *
+ * Exported because `/v1/balance` must compute "what could this caller spend" with exactly
+ * the same rule that `spend()` enforces. Two copies of it would be one copy too many.
+ */
+export function scopeMatches(
+  scope: string | null,
+  service: string,
+  resource?: string | null,
+): boolean {
+  if (scope === null) return true;
+  if (scope === service) return true;
+  return resource ? scope === `${service}:${resource}` : false;
+}
+
 export class BillingStore {
   constructor(private db: D1Database) {}
 
@@ -176,24 +231,30 @@ export class BillingStore {
   }
 
   /**
-   * The buckets a spend by `service` may draw from, in the order it must draw them.
+   * The buckets a spend may draw from, in the order it must draw them.
    *
-   * PROMOTIONAL FIRST, then purchased. Promotional credits are a marketing expense that
-   * can never be withdrawn or paid out, so spending them before money the customer
-   * actually handed over is the order that is fair to them and cheap for us.
+   * SPEND THE LEAST VALUABLE CREDIT FIRST, which is what SPEND_ORDER encodes: `promotional`
+   * is our marketing expense and can never be withdrawn, `purchased` is money the customer
+   * handed over, and `earned` is money we OWE an author. Taking them in that order leaves
+   * the credits the holder could get real value out of until last, which is the order that
+   * is fair to them and cheap for us.
    *
-   * A SCOPED GRANT IS ONLY VISIBLE TO ITS OWN SERVICE. That is how the three free months
-   * on one product are stopped from buying LLM tokens on another, without inventing a
-   * second wallet that could strand somebody's credits.
+   * A GRANT IS ONLY VISIBLE TO WHAT IT WAS SCOPED TO, and `scope` is MATCHED rather than
+   * compared, so one column expresses three widths - see `scopeMatches`.
    */
-  private eligible(rows: { kind: string; scope: string | null; credits: number }[], service: string) {
+  private eligible(
+    rows: { kind: string; scope: string | null; credits: number }[],
+    service: string,
+    resource?: string | null,
+  ) {
     return rows
-      .filter((r) => r.credits > 0 && (r.scope === null || r.scope === service))
+      .filter((r) => r.credits > 0 && scopeMatches(r.scope, service, resource))
       .sort((a, b) => {
-        if (a.kind !== b.kind) return a.kind === "promotional" ? -1 : 1;
-        // Within a kind, a scoped bucket goes before an unscoped one: the narrower credits
-        // are the ones that would otherwise be left behind unusable.
-        return (a.scope === null ? 1 : 0) - (b.scope === null ? 1 : 0);
+        const byKind = spendRank(a.kind) - spendRank(b.kind);
+        if (byKind !== 0) return byKind;
+        // Within a kind, the NARROWER bucket goes first: credits that can be spent on the
+        // least are the ones that would otherwise be left behind unusable.
+        return scopeWidth(a.scope) - scopeWidth(b.scope);
       });
   }
 
@@ -211,6 +272,13 @@ export class BillingStore {
    */
   async spend(opts: {
     accountId: string; service: string; amount: number;
+    /**
+     * WHAT THE MONEY IS FOR, as an eligibility key rather than a description - `reason` is
+     * the description. Omitting it is not the same as passing anything: a spend that does
+     * not say what it is buying cannot reach a `service:resource` bucket at all, which is
+     * what makes a narrow grant safe by default rather than safe by remembering.
+     */
+    resource?: string | null;
     reason: string; ref?: string | null; idemKey: string;
   }): Promise<{ ok: true; spent: { kind: string; credits: number }[]; replayed: boolean }
           | { ok: false; error: "insufficient" | "bad_amount"; balance: number }> {
@@ -234,7 +302,7 @@ export class BillingStore {
     }
 
     const rows = await this.balances(accountId);
-    const buckets = this.eligible(rows, service);
+    const buckets = this.eligible(rows, service, opts.resource ?? null);
     const available = buckets.reduce((n, b) => n + b.credits, 0);
     if (available < amount) return { ok: false, error: "insufficient", balance: available };
 
@@ -275,8 +343,10 @@ export class BillingStore {
    * Idempotent on idemKey, the same discipline addCredits has always had on a Paddle id.
    */
   async grant(opts: {
-    accountId: string; credits: number; kind: "purchased" | "promotional";
-    reason: string; service?: string | null; scope?: string | null;
+    accountId: string; credits: number; kind: CreditKind;
+    reason: string; service?: string | null;
+    /** NULL spends anywhere, `service` anywhere in it, `service:resource` on one thing. */
+    scope?: string | null;
     ref?: string | null; idemKey: string;
   }): Promise<boolean> {
     const done = await this.db
