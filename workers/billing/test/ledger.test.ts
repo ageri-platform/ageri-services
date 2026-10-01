@@ -214,3 +214,90 @@ describe("the journal is the balance", () => {
     ).rejects.toThrow();
   });
 });
+
+// ── One month of the journal, grouped into transactions (TC-29 S2c) ──────────
+//
+// The journal has been the transaction log since S2 and nothing could read it: balances sum it,
+// idempotency probes it, and no route listed it. These cover the two things a listing gets wrong
+// if nobody thinks about it - that one purchase is several legs, and that an unbounded history is
+// the one query whose cost grows for ever.
+describe("listing a month of the journal", () => {
+  const month = (d: string) => [`${d}-01`, `${d}-01`.replace(/^(\d{4})-(\d{2})/, (_, y, m) =>
+    m === "12" ? `${Number(y) + 1}-01` : `${y}-${String(Number(m) + 1).padStart(2, "0")}`)];
+
+  /** A row written at a chosen time, which grant() cannot do: it stamps datetime('now'). */
+  async function at(account: string, when: string, parts: { delta: number; kind: string; scope?: string | null }[],
+                    reason: string, ref: string | null, idem: string | null) {
+    for (const p of parts) {
+      await env.DB.prepare(
+        `INSERT INTO entry (account_id, delta, kind, scope, service, reason, ref, idem_key, created_at)
+         VALUES (?, ?, ?, ?, 'terminal-connect', ?, ?, ?, ?)`,
+      ).bind(account, p.delta, p.kind, p.scope ?? null, reason, ref, idem, when).run();
+    }
+  }
+
+  it("makes one purchase one transaction, however many buckets paid for it", async () => {
+    const { account } = await withCredits([]);
+    await at(account, "2026-09-15 10:00:00",
+             [{ delta: -300, kind: "promotional", scope: "terminal-connect:namespace" },
+              { delta: -550, kind: "purchased" }],
+             "namespace_block", "huy-test.terminalconnect.ai:90d", "renew:x:1");
+
+    const [from, to] = month("2026-09");
+    const got = await store.entriesIn(account, from, to);
+    expect(got.transactions).toHaveLength(1);
+    const t = got.transactions[0]!;
+    expect(t.credits).toBe(-850);
+    expect(t.legs).toHaveLength(2);
+    expect(t.reason).toBe("namespace_block");
+    expect(t.ref).toBe("huy-test.terminalconnect.ai:90d");
+  });
+
+  // A GRANT MAY HAVE NO IDEM KEY, and two of them must not collapse into one line because they
+  // share a NULL. The row id stands in, which groups each alone - the honest answer.
+  it("does not merge two keyless grants into one", async () => {
+    const { account } = await withCredits([]);
+    await at(account, "2026-09-02 09:00:00", [{ delta: 300, kind: "promotional" }], "test_grant", "a", null);
+    await at(account, "2026-09-03 09:00:00", [{ delta: 700, kind: "purchased" }], "test_grant", "b", null);
+    const [from, to] = month("2026-09");
+    const got = await store.entriesIn(account, from, to);
+    expect(got.transactions).toHaveLength(2);
+    expect(got.transactions.map((t) => t.credits).sort((a, b) => a - b)).toEqual([300, 700]);
+  });
+
+  it("keeps to its month, including the last second of the last day", async () => {
+    const { account } = await withCredits([]);
+    await at(account, "2026-08-31 23:59:59", [{ delta: 10, kind: "purchased" }], "test_grant", "aug", "k1");
+    await at(account, "2026-09-01 00:00:00", [{ delta: 20, kind: "purchased" }], "test_grant", "sep-first", "k2");
+    await at(account, "2026-09-30 23:59:59", [{ delta: 30, kind: "purchased" }], "test_grant", "sep-last", "k3");
+    await at(account, "2026-10-01 00:00:00", [{ delta: 40, kind: "purchased" }], "test_grant", "oct", "k4");
+
+    const [from, to] = month("2026-09");
+    const got = await store.entriesIn(account, from, to);
+    expect(got.transactions.map((t) => t.ref).sort()).toEqual(["sep-first", "sep-last"]);
+  });
+
+  it("answers newest first, and says when there is more", async () => {
+    const { account } = await withCredits([]);
+    for (let i = 1; i <= 4; i++) {
+      await at(account, `2026-07-0${i} 12:00:00`, [{ delta: i, kind: "purchased" }], "test_grant", `n${i}`, `j${i}`);
+    }
+    const [from, to] = month("2026-07");
+    const all = await store.entriesIn(account, from, to);
+    expect(all.transactions.map((t) => t.ref)).toEqual(["n4", "n3", "n2", "n1"]);
+    expect(all.more).toBe(false);
+    const page = await store.entriesIn(account, from, to, 2);
+    expect(page.transactions.map((t) => t.ref)).toEqual(["n4", "n3"]);
+    expect(page.more).toBe(true);
+  });
+
+  // READING MUST NOT CREATE. accountFor() mints a link when it finds none, which is right before
+  // money moves and wrong here: asking to see the history of an identity that has none would
+  // quietly give it a ledger account.
+  it("finds an account without making one", async () => {
+    const stranger = who();
+    expect(await store.findAccount("terminal-connect", stranger)).toBeNull();
+    const made = await store.accountFor("terminal-connect", stranger);
+    expect(await store.findAccount("terminal-connect", stranger)).toBe(made);
+  });
+});

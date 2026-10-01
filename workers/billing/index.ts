@@ -313,6 +313,33 @@ export default {
       });
     }
 
+    // GET /v1/entries?service=&identity=&from=&to=&limit=  - one range of the journal
+    //
+    // THE JOURNAL IS ALREADY THE TRANSACTION LOG, and nothing here starts recording anything:
+    // every in and out has been an append-only row since TC-27 S2, read until now only as a SUM
+    // for balances and for idempotency replay. What was missing was a way to SEE it, which is
+    // this route and a screen (terminal-connect TC-29 S2c).
+    //
+    // A RANGE IS REQUIRED, deliberately. "This account's whole history" is the one shape whose
+    // cost grows for ever, and the screen asks for a calendar month anyway.
+    if (request.method === "GET" && url.pathname === "/v1/entries") {
+      const service = (url.searchParams.get("service") ?? "").trim();
+      const identity = (url.searchParams.get("identity") ?? "").trim();
+      const from = (url.searchParams.get("from") ?? "").trim();
+      const to = (url.searchParams.get("to") ?? "").trim();
+      if (!service || !identity) return json({ error: "service and identity are required" }, 400);
+      if (!/^\d{4}-\d{2}-\d{2}/.test(from) || !/^\d{4}-\d{2}-\d{2}/.test(to)) {
+        return json({ error: "from and to are required, as dates" }, 400);
+      }
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 50, 1), 200);
+      // THE ACCOUNT IS LOOKED UP, NEVER CREATED. accountFor() mints a link for an unknown
+      // identity, which is right when money is about to move and wrong for a read: asking to see
+      // the history of an identity that has none would quietly give it a ledger account.
+      const account = await store.findAccount(service, identity);
+      if (!account) return json({ account: null, transactions: [], more: false });
+      return json({ account, ...(await store.entriesIn(account, from, to, limit)) });
+    }
+
     // ── VietQR: get QR link ───────────────────────────────────────────────────
     // GET /api/payment/get_qr_link/:namespace?tier=5
 

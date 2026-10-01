@@ -298,6 +298,19 @@ export class BillingStore {
   }
 
   /**
+   * The account this identity already has, or null. accountFor() MINTS one when it finds
+   * nothing, which is right when money is about to move and wrong for a read - asking to see the
+   * history of an identity that has none must not quietly give it a ledger account.
+   */
+  async findAccount(service: string, identityId: string): Promise<string | null> {
+    const row = await this.db
+      .prepare("SELECT account_id FROM account_link WHERE service = ? AND service_identity_id = ?")
+      .bind(service, identityId)
+      .first<{ account_id: string }>();
+    return row?.account_id ?? null;
+  }
+
+  /**
    * What this account holds, per bucket, as a GROUP BY over the journal rather than a
    * column. Credits do not expire (huy, 2026-09-27), so same kind and scope are fungible
    * and there is nothing to track per grant - which is what deleted lot tracking entirely.
@@ -309,6 +322,48 @@ export class BillingStore {
       .bind(accountId)
       .all<{ kind: string; scope: string | null; credits: number }>();
     return results;
+  }
+
+  /**
+   * ONE MONTH OF THIS ACCOUNT'S JOURNAL, GROUPED INTO TRANSACTIONS (terminal-connect TC-29 S2c).
+   *
+   * THE LEGS ARE NOT THE TRANSACTIONS. One 850-credit purchase writes -300 promotional and -550
+   * purchased, because gifts are spent first - listed raw that reads as two purchases of one
+   * thing. `idem_key` IS the transaction, so it is the grouping key; grants written without one
+   * fall back to their own row id, which groups them alone and is correct.
+   *
+   * THE RANGE IS WHAT KEEPS THIS CHEAP, not a LIMIT. A query bounded by account and a date range
+   * costs the same whatever the history behind it; "everything, newest 50" has to walk a growing
+   * tail first. The caller picks a calendar month (terminal-connect's screen does), and the page
+   * size still applies on top, because one metered month can be thousands of rows.
+   */
+  async entriesIn(accountId: string, fromISO: string, toISO: string, limit = 50): Promise<{
+    transactions: { key: string; at: string; reason: string; ref: string | null; service: string | null;
+                    credits: number; legs: { kind: string; scope: string | null; credits: number }[] }[];
+    more: boolean;
+  }> {
+    const { results } = await this.db
+      .prepare(`SELECT id, delta, kind, scope, service, reason, ref, idem_key, created_at
+                  FROM entry
+                 WHERE account_id = ? AND created_at >= ? AND created_at < ?
+                 ORDER BY created_at DESC, id DESC`)
+      .bind(accountId, fromISO, toISO)
+      .all<{ id: number; delta: number; kind: string; scope: string | null; service: string | null;
+             reason: string; ref: string | null; idem_key: string | null; created_at: string }>();
+
+    const byKey = new Map<string, any>();
+    for (const r of results) {
+      const key = r.idem_key || `#${r.id}`;
+      let t = byKey.get(key);
+      if (!t) {
+        t = { key, at: r.created_at, reason: r.reason, ref: r.ref, service: r.service, credits: 0, legs: [] };
+        byKey.set(key, t);
+      }
+      t.credits += r.delta;
+      t.legs.push({ kind: r.kind, scope: r.scope, credits: r.delta });
+    }
+    const all = [...byKey.values()];
+    return { transactions: all.slice(0, limit), more: all.length > limit };
   }
 
   /**

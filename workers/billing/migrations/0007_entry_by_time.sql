@@ -1,0 +1,12 @@
+-- The index the transaction log reads by (terminal-connect TC-29 S2c).
+--
+-- entry_by_account(account_id, kind, scope) serves the BALANCE question - sum this account's
+-- buckets - and cannot serve this one: "this account's entries between two dates, newest first"
+-- would scan every row the account has and sort them. One index per question, and this is a
+-- different question.
+--
+-- (account_id, created_at) covers the filter AND the order in one scan, and created_at is an
+-- ISO string written by datetime('now'), so lexicographic order is chronological order. A range
+-- query against it costs the same whatever history sits behind it, which is the whole reason the
+-- screen asks for one calendar month rather than everything.
+CREATE INDEX IF NOT EXISTS entry_by_time ON entry(account_id, created_at);
